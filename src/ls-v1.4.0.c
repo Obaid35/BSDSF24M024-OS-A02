@@ -1,11 +1,11 @@
 /*
-* Programming Assignment 02: ls-v1.3.0
-* Feature-4: Horizontal Column Display (-x)
+* Programming Assignment 02: ls-v1.4.0
+* Feature-5: Alphabetical Sort
 *
 * Usage:
-*       $ ls                 (multi-column listing, "down then across")
-*       $ ls -l              (long listing)
-*       $ ls -x              (horizontal listing, "left to right")
+*       $ ls                 (sorted, "down then across")
+*       $ ls -l              (sorted, long listing)
+*       $ ls -x              (sorted, horizontal listing)
 *       $ ls -x /home /etc
 */
 #define _DEFAULT_SOURCE
@@ -44,6 +44,7 @@ struct widths {
 void do_ls(const char *dir, int mode);
 static int  read_names(const char *dir, char ***out, int *count, size_t *maxlen);
 static void free_names(char **names, int count);
+static int  compare_names(const void *a, const void *b);
 static int  term_width(void);
 static void print_columns(char **names, int count, size_t maxlen);
 static void print_horizontal(char **names, int count, size_t maxlen);
@@ -105,7 +106,11 @@ void do_ls(const char *dir, int mode)
     if (read_names(dir, &names, &count, &maxlen) == -1)
         return;
 
-    /* Step 2: display */
+    /* Step 2: sort alphabetically (before ANY display function is called) */
+    if (count > 1)
+        qsort(names, count, sizeof(char *), compare_names);
+
+    /* Step 3: display */
     switch (mode)
     {
     case MODE_LONG:
@@ -119,7 +124,7 @@ void do_ls(const char *dir, int mode)
         break;
     }
 
-    /* Step 3: give the memory back */
+    /* Step 4: give the memory back */
     free_names(names, count);
 }
 
@@ -179,6 +184,18 @@ static int read_names(const char *dir, char ***out, int *count, size_t *maxlen)
     *count = n;
     *maxlen = longest;
     return 0;
+}
+
+/*
+ * Comparison function for qsort(). qsort() hands us POINTERS TO the array
+ * elements. Each element is a char *, so each argument is really a char **.
+ * It must return <0, 0 or >0 exactly like strcmp().
+ */
+static int compare_names(const void *a, const void *b)
+{
+    const char *s1 = *(const char * const *)a;
+    const char *s2 = *(const char * const *)b;
+    return strcmp(s1, s2);
 }
 
 static void free_names(char **names, int count)
