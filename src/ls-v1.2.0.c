@@ -1,9 +1,9 @@
 /*
-* Programming Assignment 02: ls-v1.1.0
-* Feature-2: Complete Long Listing Format (-l)
+* Programming Assignment 02: ls-v1.2.0
+* Feature-3: Column Display (down then across)
 *
 * Usage:
-*       $ ls                 (simple listing, one name per line)
+*       $ ls                 (multi-column listing, "down then across")
 *       $ ls -l              (long listing)
 *       $ ls -l /home /etc
 */
@@ -20,6 +20,7 @@
 #include <grp.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #include <sys/sysmacros.h>
 
 extern int errno;
@@ -33,7 +34,11 @@ struct widths {
 };
 
 void do_ls(const char *dir, int long_flag);
-static void do_ls_long(const char *dir);
+static int  read_names(const char *dir, char ***out, int *count, size_t *maxlen);
+static void free_names(char **names, int count);
+static int  term_width(void);
+static void print_columns(char **names, int count, size_t maxlen);
+static void print_long(const char *dir, char **names, int count);
 static void print_long_entry(const char *path, const char *name,
                              const struct stat *st, const struct widths *w);
 static void build_path(const char *dir, const char *name, char *buf, size_t size);
@@ -48,7 +53,6 @@ int main(int argc, char *argv[])
     int long_flag = 0;
     int opt;
 
-    /* getopt() walks over the command line and returns one option letter per call */
     while ((opt = getopt(argc, argv, "l")) != -1)
     {
         switch (opt)
@@ -62,7 +66,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* After getopt() finishes, optind is the index of the first non-option argument */
     if (optind == argc)
     {
         do_ls(".", long_flag);
@@ -81,102 +84,182 @@ int main(int argc, char *argv[])
 
 void do_ls(const char *dir, int long_flag)
 {
-    if (long_flag)
-    {
-        do_ls_long(dir);
-        return;
-    }
+    char **names = NULL;
+    int count = 0;
+    size_t maxlen = 0;
 
-    /* Original simple behaviour of v1.0.0 */
-    struct dirent *entry;
-    DIR *dp = opendir(dir);
-    if (dp == NULL)
-    {
-        fprintf(stderr, "Cannot open directory : %s\n", dir);
+    /* Step 1: read ALL the names into memory first */
+    if (read_names(dir, &names, &count, &maxlen) == -1)
         return;
-    }
-    errno = 0;
-    while ((entry = readdir(dp)) != NULL)
-    {
-        if (entry->d_name[0] == '.')
-            continue;
-        printf("%s\n", entry->d_name);
-    }
-    if (errno != 0)
-    {
-        perror("readdir failed");
-    }
-    closedir(dp);
+
+    /* Step 2: display */
+    if (long_flag)
+        print_long(dir, names, count);
+    else
+        print_columns(names, count, maxlen);
+
+    /* Step 3: give the memory back */
+    free_names(names, count);
 }
 
 /*
- * Long listing. Two passes over the directory:
- *   pass 1: lstat() every entry, find the widest value of each column, add up blocks
- *   pass 2: print every entry using those widths so the columns line up
+ * Reads every (non-hidden) name of a directory into a dynamically growing
+ * array of strings. Also reports the length of the longest name.
+ * Returns 0 on success, -1 if the directory cannot be opened.
  */
-static void do_ls_long(const char *dir)
+static int read_names(const char *dir, char ***out, int *count, size_t *maxlen)
 {
-    struct dirent *entry;
-    struct stat st;
-    struct widths w = {1, 1, 1, 1};
-    char path[PATH_MAX];
-    char buf[64];
-    long long total = 0;
-
     DIR *dp = opendir(dir);
     if (dp == NULL)
     {
         fprintf(stderr, "Cannot open directory : %s\n", dir);
-        return;
+        return -1;
     }
 
-    /* ---- pass 1 ---- */
+    char **names = NULL;
+    int n = 0, capacity = 0;
+    size_t longest = 0;
+    struct dirent *entry;
+
     errno = 0;
     while ((entry = readdir(dp)) != NULL)
     {
         if (entry->d_name[0] == '.')
             continue;
-        build_path(dir, entry->d_name, path, sizeof(path));
-        if (lstat(path, &st) == -1)
+
+        if (n == capacity) /* array full: double its size */
+        {
+            capacity = (capacity == 0) ? 16 : capacity * 2;
+            char **tmp = realloc(names, capacity * sizeof(char *));
+            if (tmp == NULL)
+            {
+                perror("realloc failed");
+                exit(EXIT_FAILURE);
+            }
+            names = tmp;
+        }
+
+        names[n] = strdup(entry->d_name); /* own copy: entry is reused by readdir */
+        if (names[n] == NULL)
+        {
+            perror("strdup failed");
+            exit(EXIT_FAILURE);
+        }
+        size_t len = strlen(names[n]);
+        if (len > longest)
+            longest = len;
+        n++;
+    }
+    if (errno != 0)
+        perror("readdir failed");
+
+    closedir(dp);
+    *out = names;
+    *count = n;
+    *maxlen = longest;
+    return 0;
+}
+
+static void free_names(char **names, int count)
+{
+    for (int i = 0; i < count; i++)
+        free(names[i]);
+    free(names);
+}
+
+/* Terminal width in characters; falls back to 80 if it cannot be found */
+static int term_width(void)
+{
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+    return 80;
+}
+
+/*
+ * "Down then across":
+ *      a  d  g
+ *      b  e  h
+ *      c  f
+ * item index for (row r, column c) is  r + c * rows
+ */
+static void print_columns(char **names, int count, size_t maxlen)
+{
+    if (count == 0)
+        return;
+
+    int width = term_width();
+    int colw = (int)maxlen + 2;      /* longest name + 2 spaces between columns */
+    int cols = width / colw;
+    if (cols < 1)     cols = 1;      /* a very long name: one per line */
+    if (cols > count) cols = count;
+    int rows = (count + cols - 1) / cols; /* ceiling of count / cols */
+
+    for (int r = 0; r < rows; r++)
+    {
+        for (int c = 0; c < cols; c++)
+        {
+            int idx = r + c * rows;
+            if (idx >= count)
+                break;
+            printf("%s", names[idx]);
+            /* pad only if another item follows on this row */
+            if (idx + rows < count && c + 1 < cols)
+                printf("%*s", colw - (int)strlen(names[idx]), "");
+        }
+        putchar('\n');
+    }
+}
+
+static void print_long(const char *dir, char **names, int count)
+{
+    struct stat *sts = malloc((count > 0 ? count : 1) * sizeof(struct stat));
+    int *ok = calloc(count > 0 ? count : 1, sizeof(int));
+    if (sts == NULL || ok == NULL)
+    {
+        perror("malloc failed");
+        exit(EXIT_FAILURE);
+    }
+
+    struct widths w = {1, 1, 1, 1};
+    char path[PATH_MAX], buf[64];
+    long long total = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        build_path(dir, names[i], path, sizeof(path));
+        if (lstat(path, &sts[i]) == -1)
         {
             perror(path);
             continue;
         }
-        total += st.st_blocks; /* st_blocks counts 512-byte units */
+        ok[i] = 1;
+        total += sts[i].st_blocks;
 
-        int n = num_width(st.st_nlink);
+        int n = num_width(sts[i].st_nlink);
         if (n > w.links) w.links = n;
-
-        owner_name(st.st_uid, buf, sizeof(buf));
+        owner_name(sts[i].st_uid, buf, sizeof(buf));
         n = (int)strlen(buf);
         if (n > w.user) w.user = n;
-
-        group_name(st.st_gid, buf, sizeof(buf));
+        group_name(sts[i].st_gid, buf, sizeof(buf));
         n = (int)strlen(buf);
         if (n > w.group) w.group = n;
-
-        size_str(&st, buf, sizeof(buf));
+        size_str(&sts[i], buf, sizeof(buf));
         n = (int)strlen(buf);
         if (n > w.size) w.size = n;
     }
-    if (errno != 0)
-        perror("readdir failed");
 
-    /* ls prints blocks in 1024-byte units, st_blocks is in 512-byte units */
     printf("total %lld\n", total / 2);
 
-    /* ---- pass 2 ---- */
-    rewinddir(dp);
-    while ((entry = readdir(dp)) != NULL)
+    for (int i = 0; i < count; i++)
     {
-        if (entry->d_name[0] == '.')
+        if (!ok[i])
             continue;
-        build_path(dir, entry->d_name, path, sizeof(path));
-        if (lstat(path, &st) == -1)
-            continue;
-        print_long_entry(path, entry->d_name, &st, &w);
+        build_path(dir, names[i], path, sizeof(path));
+        print_long_entry(path, names[i], &sts[i], &w);
     }
-    closedir(dp);
+    free(sts);
+    free(ok);
 }
 
 static void print_long_entry(const char *path, const char *name,
@@ -191,15 +274,14 @@ static void print_long_entry(const char *path, const char *name,
     group_name(st->st_gid, group, sizeof(group));
     size_str(st, size, sizeof(size));
 
-    /* ctime() returns "Wed Jun 30 21:49:08 1993\n"; characters 4..15 are "Jun 30 21:49" */
     time_t mtime = st->st_mtime;
     char *t = ctime(&mtime);
     time_t now = time(NULL);
     char when[32];
-    if (now - mtime > 15778476 || mtime > now) /* older than ~6 months (or in the future) */
-        snprintf(when, sizeof(when), "%.6s  %.4s", t + 4, t + 20); /* "Jun 30  1993" */
+    if (now - mtime > 15778476 || mtime > now)
+        snprintf(when, sizeof(when), "%.6s  %.4s", t + 4, t + 20);
     else
-        snprintf(when, sizeof(when), "%.12s", t + 4);              /* "Jun 30 21:49" */
+        snprintf(when, sizeof(when), "%.12s", t + 4);
 
     printf("%s %*lu %-*s %-*s %*s %s %s",
            perms,
@@ -221,7 +303,6 @@ static void print_long_entry(const char *path, const char *name,
     putchar('\n');
 }
 
-/* "dir" + "name" -> "dir/name" (no double slash if dir already ends with '/') */
 static void build_path(const char *dir, const char *name, char *buf, size_t size)
 {
     size_t len = strlen(dir);
@@ -231,7 +312,6 @@ static void build_path(const char *dir, const char *name, char *buf, size_t size
         snprintf(buf, size, "%s/%s", dir, name);
 }
 
-/* st_mode -> "drwxr-xr-x" */
 static void mode_to_str(mode_t mode, char *str)
 {
     if      (S_ISREG(mode))  str[0] = '-';
@@ -254,7 +334,6 @@ static void mode_to_str(mode_t mode, char *str)
     str[9] = (mode & S_IXOTH) ? 'x' : '-';
     str[10] = '\0';
 
-    /* special bits replace the 'x' position: s/S (setuid, setgid), t/T (sticky) */
     if (mode & S_ISUID) str[3] = (mode & S_IXUSR) ? 's' : 'S';
     if (mode & S_ISGID) str[6] = (mode & S_IXGRP) ? 's' : 'S';
     if (mode & S_ISVTX) str[9] = (mode & S_IXOTH) ? 't' : 'T';
@@ -266,7 +345,7 @@ static void owner_name(uid_t uid, char *buf, size_t size)
     if (pw != NULL)
         snprintf(buf, size, "%s", pw->pw_name);
     else
-        snprintf(buf, size, "%u", (unsigned)uid); /* no such user: show the number */
+        snprintf(buf, size, "%u", (unsigned)uid);
 }
 
 static void group_name(gid_t gid, char *buf, size_t size)
@@ -278,7 +357,6 @@ static void group_name(gid_t gid, char *buf, size_t size)
         snprintf(buf, size, "%u", (unsigned)gid);
 }
 
-/* Size column: normal files show bytes, device files show "major, minor" */
 static void size_str(const struct stat *st, char *buf, size_t size)
 {
     if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode))
