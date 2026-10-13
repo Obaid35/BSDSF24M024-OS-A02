@@ -1,11 +1,12 @@
 /*
-* Programming Assignment 02: ls-v1.2.0
-* Feature-3: Column Display (down then across)
+* Programming Assignment 02: ls-v1.3.0
+* Feature-4: Horizontal Column Display (-x)
 *
 * Usage:
 *       $ ls                 (multi-column listing, "down then across")
 *       $ ls -l              (long listing)
-*       $ ls -l /home /etc
+*       $ ls -x              (horizontal listing, "left to right")
+*       $ ls -x /home /etc
 */
 #define _DEFAULT_SOURCE
 #include <stdio.h>
@@ -25,6 +26,13 @@
 
 extern int errno;
 
+/* Which display function will be used */
+enum display_mode {
+    MODE_DEFAULT,      /* down then across */
+    MODE_LONG,         /* -l */
+    MODE_HORIZONTAL    /* -x */
+};
+
 /* Column widths needed to align the long listing */
 struct widths {
     int links;
@@ -33,11 +41,12 @@ struct widths {
     int size;
 };
 
-void do_ls(const char *dir, int long_flag);
+void do_ls(const char *dir, int mode);
 static int  read_names(const char *dir, char ***out, int *count, size_t *maxlen);
 static void free_names(char **names, int count);
 static int  term_width(void);
 static void print_columns(char **names, int count, size_t maxlen);
+static void print_horizontal(char **names, int count, size_t maxlen);
 static void print_long(const char *dir, char **names, int count);
 static void print_long_entry(const char *path, const char *name,
                              const struct stat *st, const struct widths *w);
@@ -50,39 +59,43 @@ static int  num_width(unsigned long long n);
 
 int main(int argc, char *argv[])
 {
-    int long_flag = 0;
+    int mode = MODE_DEFAULT;
     int opt;
 
-    while ((opt = getopt(argc, argv, "l")) != -1)
+    /* The last display option given on the command line wins */
+    while ((opt = getopt(argc, argv, "lx")) != -1)
     {
         switch (opt)
         {
         case 'l':
-            long_flag = 1;
+            mode = MODE_LONG;
+            break;
+        case 'x':
+            mode = MODE_HORIZONTAL;
             break;
         default:
-            fprintf(stderr, "Usage: %s [-l] [directory...]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-l | -x] [directory...]\n", argv[0]);
             exit(EXIT_FAILURE);
         }
     }
 
     if (optind == argc)
     {
-        do_ls(".", long_flag);
+        do_ls(".", mode);
     }
     else
     {
         for (int i = optind; i < argc; i++)
         {
             printf("Directory listing of %s : \n", argv[i]);
-            do_ls(argv[i], long_flag);
+            do_ls(argv[i], mode);
             puts("");
         }
     }
     return 0;
 }
 
-void do_ls(const char *dir, int long_flag)
+void do_ls(const char *dir, int mode)
 {
     char **names = NULL;
     int count = 0;
@@ -93,10 +106,18 @@ void do_ls(const char *dir, int long_flag)
         return;
 
     /* Step 2: display */
-    if (long_flag)
+    switch (mode)
+    {
+    case MODE_LONG:
         print_long(dir, names, count);
-    else
+        break;
+    case MODE_HORIZONTAL:
+        print_horizontal(names, count, maxlen);
+        break;
+    default:
         print_columns(names, count, maxlen);
+        break;
+    }
 
     /* Step 3: give the memory back */
     free_names(names, count);
@@ -209,6 +230,37 @@ static void print_columns(char **names, int count, size_t maxlen)
         }
         putchar('\n');
     }
+}
+
+/*
+ * "Across" (row-major): fill a row left to right, start a new row when the
+ * next item would not fit in the terminal width.
+ *      a  b  c  d
+ *      e  f  g
+ */
+static void print_horizontal(char **names, int count, size_t maxlen)
+{
+    if (count == 0)
+        return;
+
+    int width = term_width();
+    int colw = (int)maxlen + 2;
+    int pos = 0;                 /* how many characters are already on this line */
+
+    for (int i = 0; i < count; i++)
+    {
+        if (pos > 0 && pos + colw > width) /* does not fit: start a new line */
+        {
+            putchar('\n');
+            pos = 0;
+        }
+        printf("%s", names[i]);
+        pos += colw;
+        /* pad only if the next item will still fit on this line */
+        if (i + 1 < count && pos + colw <= width)
+            printf("%*s", colw - (int)strlen(names[i]), "");
+    }
+    putchar('\n');
 }
 
 static void print_long(const char *dir, char **names, int count)
