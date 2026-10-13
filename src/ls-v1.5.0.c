@@ -1,11 +1,13 @@
 /*
-* Programming Assignment 02: ls-v1.4.0
-* Feature-5: Alphabetical Sort
+* Programming Assignment 02: ls-v1.5.0
+* Feature-6: Colorized Output Based on File Type
+*
+*   Blue = directory        Green = executable      Red = .tar .gz .zip
+*   Pink = symbolic link    Reverse video = device / pipe / socket
 *
 * Usage:
-*       $ ls                 (sorted, "down then across")
-*       $ ls -l              (sorted, long listing)
-*       $ ls -x              (sorted, horizontal listing)
+*       $ ls
+*       $ ls -l
 *       $ ls -x /home /etc
 */
 #define _DEFAULT_SOURCE
@@ -25,6 +27,17 @@
 #include <sys/sysmacros.h>
 
 extern int errno;
+
+/* ANSI escape codes: ESC [ <attributes> m   (ESC = octal 033) */
+#define COLOR_RESET   "\033[0m"
+#define COLOR_BLUE    "\033[0;34m"
+#define COLOR_GREEN   "\033[0;32m"
+#define COLOR_RED     "\033[0;31m"
+#define COLOR_PINK    "\033[0;35m"
+#define COLOR_REVERSE "\033[7m"
+
+/* 1 when the output goes to a terminal, 0 when it is piped/redirected to a file */
+static int use_color = 0;
 
 /* Which display function will be used */
 enum display_mode {
@@ -46,8 +59,12 @@ static int  read_names(const char *dir, char ***out, int *count, size_t *maxlen)
 static void free_names(char **names, int count);
 static int  compare_names(const void *a, const void *b);
 static int  term_width(void);
-static void print_columns(char **names, int count, size_t maxlen);
-static void print_horizontal(char **names, int count, size_t maxlen);
+static void print_columns(const char *dir, char **names, int count, size_t maxlen);
+static void print_horizontal(const char *dir, char **names, int count, size_t maxlen);
+static const char *color_of(const char *name, mode_t mode);
+static void print_name(const char *name, mode_t mode);
+static mode_t mode_of(const char *dir, const char *name);
+static int  has_suffix(const char *name, const char *suffix);
 static void print_long(const char *dir, char **names, int count);
 static void print_long_entry(const char *path, const char *name,
                              const struct stat *st, const struct widths *w);
@@ -62,6 +79,9 @@ int main(int argc, char *argv[])
 {
     int mode = MODE_DEFAULT;
     int opt;
+
+    /* Colors only make sense on a terminal (like ls --color=auto) */
+    use_color = isatty(STDOUT_FILENO);
 
     /* The last display option given on the command line wins */
     while ((opt = getopt(argc, argv, "lx")) != -1)
@@ -117,10 +137,10 @@ void do_ls(const char *dir, int mode)
         print_long(dir, names, count);
         break;
     case MODE_HORIZONTAL:
-        print_horizontal(names, count, maxlen);
+        print_horizontal(dir, names, count, maxlen);
         break;
     default:
-        print_columns(names, count, maxlen);
+        print_columns(dir, names, count, maxlen);
         break;
     }
 
@@ -221,7 +241,7 @@ static int term_width(void)
  *      c  f
  * item index for (row r, column c) is  r + c * rows
  */
-static void print_columns(char **names, int count, size_t maxlen)
+static void print_columns(const char *dir, char **names, int count, size_t maxlen)
 {
     if (count == 0)
         return;
@@ -240,7 +260,7 @@ static void print_columns(char **names, int count, size_t maxlen)
             int idx = r + c * rows;
             if (idx >= count)
                 break;
-            printf("%s", names[idx]);
+            print_name(names[idx], mode_of(dir, names[idx]));
             /* pad only if another item follows on this row */
             if (idx + rows < count && c + 1 < cols)
                 printf("%*s", colw - (int)strlen(names[idx]), "");
@@ -255,7 +275,7 @@ static void print_columns(char **names, int count, size_t maxlen)
  *      a  b  c  d
  *      e  f  g
  */
-static void print_horizontal(char **names, int count, size_t maxlen)
+static void print_horizontal(const char *dir, char **names, int count, size_t maxlen)
 {
     if (count == 0)
         return;
@@ -271,7 +291,7 @@ static void print_horizontal(char **names, int count, size_t maxlen)
             putchar('\n');
             pos = 0;
         }
-        printf("%s", names[i]);
+        print_name(names[i], mode_of(dir, names[i]));
         pos += colw;
         /* pad only if the next item will still fit on this line */
         if (i + 1 < count && pos + colw <= width)
@@ -352,13 +372,14 @@ static void print_long_entry(const char *path, const char *name,
     else
         snprintf(when, sizeof(when), "%.12s", t + 4);
 
-    printf("%s %*lu %-*s %-*s %*s %s %s",
+    printf("%s %*lu %-*s %-*s %*s %s ",
            perms,
            w->links, (unsigned long)st->st_nlink,
            w->user, user,
            w->group, group,
            w->size, size,
-           when, name);
+           when);
+    print_name(name, st->st_mode);
 
     if (S_ISLNK(st->st_mode))
     {
@@ -370,6 +391,50 @@ static void print_long_entry(const char *path, const char *name,
         }
     }
     putchar('\n');
+}
+
+/* Returns 1 if name ends with suffix (".tar" matches "a.tar" but not "a.tar.txt") */
+static int has_suffix(const char *name, const char *suffix)
+{
+    size_t n = strlen(name), s = strlen(suffix);
+    return n > s && strcmp(name + n - s, suffix) == 0;
+}
+
+/* Decide the color from the file type (st_mode) and, for archives, from the name */
+static const char *color_of(const char *name, mode_t mode)
+{
+    if (S_ISLNK(mode))                                  /* needs lstat, not stat */
+        return COLOR_PINK;
+    if (S_ISDIR(mode))
+        return COLOR_BLUE;
+    if (S_ISCHR(mode) || S_ISBLK(mode) || S_ISFIFO(mode) || S_ISSOCK(mode))
+        return COLOR_REVERSE;
+    if (has_suffix(name, ".tar") || has_suffix(name, ".gz") || has_suffix(name, ".zip"))
+        return COLOR_RED;
+    if (mode & (S_IXUSR | S_IXGRP | S_IXOTH))           /* executable by owner, group or others */
+        return COLOR_GREEN;
+    return NULL;                                        /* ordinary file: default color */
+}
+
+/* Print a file name, wrapped in its color code and followed by the reset code */
+static void print_name(const char *name, mode_t mode)
+{
+    const char *color = use_color ? color_of(name, mode) : NULL;
+    if (color != NULL)
+        printf("%s%s%s", color, name, COLOR_RESET);
+    else
+        printf("%s", name);
+}
+
+/* st_mode of dir/name (0 if lstat fails) */
+static mode_t mode_of(const char *dir, const char *name)
+{
+    char path[PATH_MAX];
+    struct stat st;
+    build_path(dir, name, path, sizeof(path));
+    if (lstat(path, &st) == -1)
+        return 0;
+    return st.st_mode;
 }
 
 static void build_path(const char *dir, const char *name, char *buf, size_t size)
